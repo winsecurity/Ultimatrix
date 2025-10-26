@@ -6,6 +6,8 @@
 
 #define IOCTL_METHOD_BUFFER_TEST CTL_CODE(FILE_DEVICE_UNKNOWN, 0x800, METHOD_BUFFERED, FILE_ANY_ACCESS)
 #define IOCTL_METHOD_IN_DIRECT_TEST CTL_CODE(FILE_DEVICE_UNKNOWN, 0x800, METHOD_IN_DIRECT, FILE_ANY_ACCESS)
+#define IOCTL_METHOD_OUT_DIRECT_TEST CTL_CODE(FILE_DEVICE_UNKNOWN, 0x802, METHOD_OUT_DIRECT, FILE_ANY_ACCESS)
+#define IOCTL_METHOD_NEITHER_TEST CTL_CODE(FILE_DEVICE_UNKNOWN, 0x803, METHOD_NEITHER, FILE_ANY_ACCESS)
 
 
 
@@ -100,13 +102,55 @@ NTSTATUS DeviceControlHandler(PDEVICE_OBJECT, PIRP irp) {
 
 		KdPrint(("METHOD_IN_DIRECT IO buffering mode\n"));
 
-		// input buffer from user mode is written in to irp.AssociatedIrp.SystemBuffer
-		// output buffer gets locked is accessible in irp.Mdladdress
-		// we can use MmGetSystemAddressForMdlSafe() to get system pointer to the mapped output buffer
-		char inputbuffer[512];
-		if (iostacklocation->Parameters.DeviceIoControl.InputBufferLength<=sizeof(inputbuffer) &&
-			irp->AssociatedIrp.SystemBuffer!=NULL) {
-			
+		// This mode is used to read large data from user mode application.
+		// User's input buffer is mapped into Irp.AssociatedIrp.SystemBuffer as usual.
+		// user's output buffer is locked by mdl in ram and can be mapped into
+		// system space. 
+		// This output buffer describes the LARGE INPUT DATA from user
+		// driver cannot write into it but can only read from it.
+
+	    PVOID userinputbufferaddress =	MmGetSystemAddressForMdlSafe(irp->MdlAddress, NormalPagePriority);
+		if (userinputbufferaddress == NULL) {
+			status = STATUS_INSUFFICIENT_RESOURCES;
+			goto completeirp;
+		}
+
+		char userinputbuffer[1024];
+		if(sizeof(userinputbuffer)<iostacklocation->Parameters.DeviceIoControl.OutputBufferLength){ 
+			status = STATUS_BUFFER_TOO_SMALL;
+			goto completeirp;
+		}
+
+
+		RtlCopyMemory(&userinputbuffer, userinputbufferaddress, iostacklocation->Parameters.DeviceIoControl.OutputBufferLength);
+		KdPrint(("Received from user: %s of size: %d\n", &userinputbuffer,
+			iostacklocation->Parameters.DeviceIoControl.OutputBufferLength));
+
+
+		
+		// we no need to specify any data to user
+		// we can simply mention iostatus.information to zero
+		status = STATUS_SUCCESS;
+		len = 1;
+		goto completeirp;
+
+
+
+	}
+	
+
+	if (iostacklocation->Parameters.DeviceIoControl.IoControlCode == IOCTL_METHOD_OUT_DIRECT_TEST) {
+		// In METHOD_OUT_DIRECT IO, input buffer is small from usermode
+		// and is copied into SystemBuffer of Irp.AssociatedIrp.SystemBuffer
+		// this is used for large output buffers driver sends to usermode app.
+
+		KdPrint(("METHOD_OUT_DIRECT IO buffering mode\n"));
+
+		
+		char inputbuffer[64];
+		if (iostacklocation->Parameters.DeviceIoControl.InputBufferLength <= sizeof(inputbuffer) &&
+			irp->AssociatedIrp.SystemBuffer != NULL) {
+
 			RtlCopyMemory(&inputbuffer, irp->AssociatedIrp.SystemBuffer, iostacklocation->Parameters.DeviceIoControl.InputBufferLength);
 			KdPrint(("Received from the user: %s\n", &inputbuffer));
 		}
@@ -114,7 +158,7 @@ NTSTATUS DeviceControlHandler(PDEVICE_OBJECT, PIRP irp) {
 			status = STATUS_BUFFER_TOO_SMALL;
 			goto completeirp;
 		}
-		
+
 
 		PVOID outputbufferaddress = MmGetSystemAddressForMdlSafe(irp->MdlAddress, NormalPagePriority);
 		if (outputbufferaddress == NULL) {
@@ -143,10 +187,38 @@ NTSTATUS DeviceControlHandler(PDEVICE_OBJECT, PIRP irp) {
 			goto completeirp;
 		}
 
-	
+	}
+
+
+	if (iostacklocation->Parameters.DeviceIoControl.IoControlCode == IOCTL_METHOD_NEITHER_TEST) {
+
+		// IN METHOD_NEITHER, we receive direct pointers to input and output buffers
+		// iostacklocation->Parameters.DeviceIoControl.Type3InputBuffer - inputbuffer address
+		// irp->UserBuffer - outputbuffer address
+
+		ULONG inlength = iostacklocation->Parameters.DeviceIoControl.InputBufferLength;
+		ULONG outlength = iostacklocation->Parameters.DeviceIoControl.OutputBufferLength;
+		PVOID outputbufferaddress = irp->UserBuffer;
+		PVOID inputbufferaddress = iostacklocation->Parameters.DeviceIoControl.Type3InputBuffer;
+
+		if (inlength != 0 && outlength != 0) {
+
+			auto inputdata = (char*)inputbufferaddress;
+
+			KdPrint(("Received from user buffer: %s\n", inputdata));
+
+			const char* s = "Hi\0";
+			RtlCopyMemory(outputbufferaddress, s, strlen(s) + 1);
+			
+			
+			status = STATUS_SUCCESS;
+			len = (int)strlen(s) + 1;
+			goto completeirp;
+		}
+
 
 	}
-	
+
 
 completeirp:
 	irp->IoStatus.Status = status;
